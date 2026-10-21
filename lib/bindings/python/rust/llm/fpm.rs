@@ -209,8 +209,13 @@ impl FpmEventRelay {
     ///         (e.g., "tcp://127.0.0.1:20380").
     #[new]
     #[pyo3(signature = (endpoint, zmq_endpoint))]
-    fn new(endpoint: Endpoint, zmq_endpoint: String) -> PyResult<Self> {
-        let inner = llm_rs::fpm_publisher::FpmEventRelay::new(endpoint.inner.clone(), zmq_endpoint)
+    fn new(py: Python<'_>, endpoint: Endpoint, zmq_endpoint: String) -> PyResult<Self> {
+        let endpoint = endpoint.inner;
+        // Initialization waits on the runtime, whose callbacks may need the GIL.
+        let inner = py
+            .allow_threads(move || {
+                llm_rs::fpm_publisher::FpmEventRelay::new(endpoint, zmq_endpoint)
+            })
             .map_err(to_pyerr)?;
         Ok(Self { inner })
     }
@@ -252,12 +257,15 @@ impl FpmDirectPublisher {
     ///         attention DP is disabled.
     #[new]
     #[pyo3(signature = (endpoint, worker_id, dp_size=1))]
-    fn new(endpoint: Endpoint, worker_id: String, dp_size: u32) -> PyResult<Self> {
-        let rt = endpoint.inner.component().drt().runtime().secondary();
-        let (inner, publishers) = rt
-            .block_on(async {
-                llm_rs::fpm_publisher::FpmDirectPublisher::new(endpoint.inner, worker_id, dp_size)
-                    .await
+    fn new(py: Python<'_>, endpoint: Endpoint, worker_id: String, dp_size: u32) -> PyResult<Self> {
+        let endpoint = endpoint.inner;
+        // Keep the same GIL/runtime lock ordering as the relay constructor.
+        let (inner, publishers) = py
+            .allow_threads(move || {
+                let rt = endpoint.component().drt().runtime().secondary();
+                rt.block_on(llm_rs::fpm_publisher::FpmDirectPublisher::new(
+                    endpoint, worker_id, dp_size,
+                ))
             })
             .map_err(to_pyerr)?;
         Ok(Self { inner, publishers })
@@ -1086,6 +1094,143 @@ impl Drop for FpmEventSubscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pause at the real constructor's discovery-registration event, before it
+    /// returns to Python. A second thread must run a Python metrics callback
+    /// during that pause; the timeout makes a missing GIL release fail, not hang.
+    struct ConstructorCheckpoint {
+        start: std::sync::mpsc::Sender<()>,
+        finished: std::sync::Mutex<std::sync::mpsc::Receiver<String>>,
+        has_progress: Arc<AtomicBool>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ConstructorCheckpoint {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "dynamo_runtime::transports::event_plane" {
+                return;
+            }
+            let mut is_registration = false;
+            event.record(
+                &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    if field.name() == "message" {
+                        is_registration =
+                            format!("{value:?}") == "EventPublisher registered with discovery";
+                    }
+                },
+            );
+            if is_registration {
+                self.start.send(()).unwrap();
+                let result = self
+                    .finished
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+                self.has_progress.store(
+                    result.is_ok_and(|text| text.contains("fpm_gil_probe 1")),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+    }
+
+    fn constructor_allows_metrics_callback(is_direct: bool) {
+        use dynamo_runtime::metrics::MetricsHierarchy;
+        use tracing_subscriber::prelude::*;
+
+        pyo3::prepare_freethreaded_python();
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime = dynamo_runtime::Runtime::from_handle(executor.handle().clone()).unwrap();
+        let mut config = dynamo_runtime::distributed::DistributedConfig::process_local();
+        // NATS event metadata with in-memory discovery needs no external server
+        // or publisher socket: these tests construct, but do not publish.
+        config.event_transport_kind = dynamo_runtime::discovery::EventTransportKind::Nats;
+        let drt = executor
+            .block_on(dynamo_runtime::DistributedRuntime::new(
+                runtime.clone(),
+                config,
+            ))
+            .unwrap();
+        let endpoint = drt
+            .namespace("fpm-gil-test")
+            .unwrap()
+            .component("worker")
+            .unwrap()
+            .endpoint("generate");
+        let registry = endpoint.get_metrics_registry().clone();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let has_progress = Arc::new(AtomicBool::new(false));
+        let callback = std::thread::spawn(move || {
+            if start_rx.recv().is_ok() {
+                // The checkpoint receiver is gone if its timeout detected the regression.
+                let _ = finished_tx.send(registry.execute_expfmt_callbacks());
+            }
+        });
+        let subscriber = tracing_subscriber::registry().with(ConstructorCheckpoint {
+            start: start_tx,
+            finished: std::sync::Mutex::new(finished_rx),
+            has_progress: has_progress.clone(),
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let zmq_endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+
+        let result = Python::with_gil(|py| -> PyResult<()> {
+            let metrics = Py::new(
+                py,
+                crate::prometheus_metrics::RuntimeMetrics::from_endpoint(endpoint.clone()),
+            )?;
+            metrics.call_method1(
+                py,
+                "register_prometheus_expfmt_callback",
+                (py.eval(c"lambda: 'fpm_gil_probe 1\\n'", None, None)?,),
+            )?;
+            let endpoint = Endpoint {
+                inner: endpoint,
+                event_loop: py.None(),
+            };
+            let publisher = tracing::subscriber::with_default(subscriber, || {
+                if is_direct {
+                    py.get_type::<FpmDirectPublisher>()
+                        .call1((endpoint, "worker", 2))
+                } else {
+                    py.get_type::<FpmEventRelay>()
+                        .call1((endpoint, zmq_endpoint))
+                }
+            })?;
+            publisher.call_method0("shutdown")?;
+            publisher.call_method0("shutdown")?;
+            Ok(())
+        });
+        // Join only after leaving the GIL, including on the regression path.
+        let callback_result = callback.join();
+        drt.shutdown();
+        runtime.shutdown();
+        executor.shutdown_timeout(Duration::from_secs(5));
+        callback_result.unwrap();
+        result.unwrap();
+        assert!(
+            has_progress.load(Ordering::SeqCst),
+            "Python metrics callback did not finish inside FPM construction"
+        );
+    }
+
+    #[test]
+    fn relay_constructor_releases_gil() {
+        constructor_allows_metrics_callback(false);
+    }
+
+    #[test]
+    fn direct_publisher_constructor_releases_gil() {
+        constructor_allows_metrics_callback(true);
+    }
 
     fn active_worker(ranks: Range<u32>, now: Instant) -> WorkerFpm {
         let mut worker = WorkerFpm::default();
