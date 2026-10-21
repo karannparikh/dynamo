@@ -210,11 +210,10 @@ impl FpmEventRelay {
     #[new]
     #[pyo3(signature = (endpoint, zmq_endpoint))]
     fn new(py: Python<'_>, endpoint: Endpoint, zmq_endpoint: String) -> PyResult<Self> {
-        let endpoint = endpoint.inner;
-        // Initialization waits on the runtime, whose callbacks may need the GIL.
+        // Don't hold the GIL while blocking on the runtime; its tasks may need it.
         let inner = py
             .allow_threads(move || {
-                llm_rs::fpm_publisher::FpmEventRelay::new(endpoint, zmq_endpoint)
+                llm_rs::fpm_publisher::FpmEventRelay::new(endpoint.inner, zmq_endpoint)
             })
             .map_err(to_pyerr)?;
         Ok(Self { inner })
@@ -258,13 +257,14 @@ impl FpmDirectPublisher {
     #[new]
     #[pyo3(signature = (endpoint, worker_id, dp_size=1))]
     fn new(py: Python<'_>, endpoint: Endpoint, worker_id: String, dp_size: u32) -> PyResult<Self> {
-        let endpoint = endpoint.inner;
-        // Keep the same GIL/runtime lock ordering as the relay constructor.
+        let rt = endpoint.inner.component().drt().runtime().secondary();
+        // Don't hold the GIL while blocking on the runtime; its tasks may need it.
         let (inner, publishers) = py
             .allow_threads(move || {
-                let rt = endpoint.component().drt().runtime().secondary();
                 rt.block_on(llm_rs::fpm_publisher::FpmDirectPublisher::new(
-                    endpoint, worker_id, dp_size,
+                    endpoint.inner,
+                    worker_id,
+                    dp_size,
                 ))
             })
             .map_err(to_pyerr)?;
