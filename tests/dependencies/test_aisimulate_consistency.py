@@ -29,6 +29,7 @@ pytestmark = [
 ]
 
 ROOT = Path(__file__).resolve().parents[2]
+AISIMULATE_EXTRA = "aisimulate"
 AISIMULATE_REQUIREMENTS = ROOT / "container/deps/requirements.aisimulate.txt"
 LOCKFILES = (
     ROOT / "Cargo.lock",
@@ -45,14 +46,28 @@ def _root_configs() -> tuple[dict, dict]:
     return pyproject, cargo
 
 
-def _python_requirement(pyproject: dict) -> Requirement:
+def _python_requirement(requirements: list[str], source: str) -> Requirement:
     matches = [
         Requirement(requirement)
-        for requirement in pyproject["project"]["dependencies"]
+        for requirement in requirements
         if canonicalize_name(Requirement(requirement).name) == "aisimulate"
     ]
-    assert len(matches) == 1, "ai-dynamo must declare one AISimulate dependency"
+    assert len(matches) == 1, f"{source} must declare one AISimulate dependency"
     return matches[0]
+
+
+def _ai_dynamo_requirement(pyproject: dict) -> Requirement:
+    return _python_requirement(
+        pyproject["project"]["optional-dependencies"][AISIMULATE_EXTRA],
+        f"ai-dynamo[{AISIMULATE_EXTRA}]",
+    )
+
+
+def _requirement_names(requirements: list[str]) -> set[str]:
+    return {
+        canonicalize_name(Requirement(requirement).name)
+        for requirement in requirements
+    }
 
 
 def _requirements_file_aisimulate_requirement(path: Path) -> Requirement:
@@ -95,7 +110,7 @@ def _locked_cargo_version(path: Path) -> Version:
 
 def test_dynamo_pins_matching_published_aisimulate_releases() -> None:
     pyproject, cargo = _root_configs()
-    python_requirement = _python_requirement(pyproject)
+    python_requirement = _ai_dynamo_requirement(pyproject)
     python_version = _exact_version(python_requirement)
     container_requirement = _requirements_file_aisimulate_requirement(
         AISIMULATE_REQUIREMENTS
@@ -117,7 +132,15 @@ def test_dynamo_pins_matching_published_aisimulate_releases() -> None:
     assert _exact_version(container_requirement) == python_version
     with (ROOT / "benchmarks/pyproject.toml").open("rb") as handle:
         benchmarks = tomllib.load(handle)
-    assert _exact_version(_python_requirement(benchmarks)) == python_version
+    assert (
+        _exact_version(
+            _python_requirement(
+                benchmarks["project"]["dependencies"],
+                "benchmarks/pyproject.toml",
+            )
+        )
+        == python_version
+    )
     assert "aisimulate" not in pyproject.get("tool", {}).get("uv", {}).get(
         "sources", {}
     )
@@ -142,7 +165,7 @@ def test_dynamo_pins_matching_published_aisimulate_releases() -> None:
 
 def test_container_stages_the_published_aisimulate_wheel() -> None:
     pyproject, _ = _root_configs()
-    python_version = _exact_version(_python_requirement(pyproject))
+    python_version = _exact_version(_ai_dynamo_requirement(pyproject))
     container_version = _exact_version(
         _requirements_file_aisimulate_requirement(AISIMULATE_REQUIREMENTS)
     )
@@ -180,9 +203,27 @@ def test_installed_aisimulate_matches_the_declared_release() -> None:
     if sys.version_info < (3, 11) or sys.version_info >= (3, 14):
         pytest.skip("AISimulate supports Python 3.11 through 3.13")
     pyproject, _ = _root_configs()
-    expected = _exact_version(_python_requirement(pyproject))
+    expected = _exact_version(_ai_dynamo_requirement(pyproject))
 
     assert Version(metadata.version("aisimulate")) == expected
+
+
+def test_ai_dynamo_base_install_omits_aisimulate() -> None:
+    pyproject, _ = _root_configs()
+
+    assert "aisimulate" not in _requirement_names(
+        pyproject["project"]["dependencies"]
+    )
+
+
+def test_ai_dynamo_aisimulate_extra_installs_aisimulate() -> None:
+    pyproject, _ = _root_configs()
+    project = pyproject["project"]
+
+    assert AISIMULATE_EXTRA in project["optional-dependencies"]
+    assert "aisimulate" in _requirement_names(
+        project["optional-dependencies"][AISIMULATE_EXTRA]
+    )
 
 
 def test_ai_dynamo_registers_only_its_aisimulate_providers() -> None:
@@ -190,6 +231,7 @@ def test_ai_dynamo_registers_only_its_aisimulate_providers() -> None:
     project = pyproject["project"]
 
     extras = set(project.get("optional-dependencies", {}))
+    assert AISIMULATE_EXTRA in extras
     assert {"sweeper", "simulate", "simulation"}.isdisjoint(extras)
     assert project["entry-points"]["aisimulate.sweep_config_providers"] == {
         "dynamo.planner": "dynamo.planner.simulation:create_provider",

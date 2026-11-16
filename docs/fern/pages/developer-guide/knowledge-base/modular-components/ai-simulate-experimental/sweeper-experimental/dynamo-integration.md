@@ -20,6 +20,12 @@ For a prebuilt environment, use a released `dynamo-planner` image with its bundl
 AISimulate artifacts. The AISimulate Python wheel and Rust crate must come from the same source
 revision.
 
+For a published Python package, install the optional AISimulate integration:
+
+```bash
+python3 -m pip install "ai-dynamo[aisimulate]"
+```
+
 For source development, start at the Dynamo checkout root in an activated Python environment with
 the [source-build prerequisites](../../../../advanced-customizations/building-from-source.md).
 Install the AISimulate dependency declared by that checkout and rebuild Dynamo's bindings:
@@ -40,9 +46,10 @@ together. A Git-pinned dependency builds AISimulate from source and requires its
 toolchain. Such development pins do not imply that a matching release wheel or crate is published;
 container builds require the published pair and matching release pins.
 
-On supported Python versions, `ai-dynamo` declares AISimulate as a base dependency. Keep that pin,
-`container/deps/requirements.aisimulate.txt`, and the `aisimulate-core` Cargo pins aligned when
-upgrading. No `ai-dynamo[simulation]` extra is required.
+Published wheels keep AISimulate optional. Install `ai-dynamo[aisimulate]` for Dynamo Replay,
+Planner and Router simulation adapters, AISimulate-backed profiling, and native Planner performance
+models. Keep the extra's pin, `container/deps/requirements.aisimulate.txt`, and the
+`aisimulate-core` Cargo pins aligned when upgrading.
 
 ## Run the Unified CLI
 
