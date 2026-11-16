@@ -15,6 +15,9 @@ from email.parser import Parser
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+
 GLIBC_FLOOR = (2, 28)
 MANYLINUX_POLICY = "manylinux_2_28"
 RUNTIME_PY_TAGS = {"cp311", "cp312"}
@@ -129,11 +132,43 @@ def assert_core_wheel_metadata(wheelhouse: Path, target_arch: str | None) -> Non
 
     ai_meta = wheel_metadata(ai_dynamo)
     runtime_meta = wheel_metadata(runtime)
-    requires = "\n".join(ai_meta.get("Requires-Dist", []))
+    requires_dist = ai_meta.get("Requires-Dist", [])
+    requires = "\n".join(requires_dist)
     runtime_version = runtime_meta["Version"]
     if f"ai-dynamo-runtime=={runtime_version}" not in requires.replace(" ", ""):
         raise AssertionError(
             f"{ai_dynamo.name} does not pin local runtime version {runtime_version}"
+        )
+
+    provides_extra = ai_meta.get("Provides-Extra", [])
+    if "aisimulate" not in provides_extra:
+        raise AssertionError(f"{ai_dynamo.name} does not provide the aisimulate extra")
+    aisimulate_requirements = []
+    for item in requires_dist:
+        requirement = Requirement(item)
+        if canonical_name(requirement.name) == "aisimulate":
+            aisimulate_requirements.append(requirement)
+    if len(aisimulate_requirements) != 1:
+        raise AssertionError(
+            f"{ai_dynamo.name} should declare one optional AISimulate requirement, "
+            f"found {aisimulate_requirements}"
+        )
+    aisimulate_requirement = aisimulate_requirements[0]
+    if aisimulate_requirement.marker is None:
+        raise AssertionError(
+            f"{ai_dynamo.name} declares AISimulate without an extra marker"
+        )
+    environment = default_environment()
+    environment["python_version"] = "3.12"
+    environment["extra"] = ""
+    if aisimulate_requirement.marker.evaluate(environment):
+        raise AssertionError(
+            f"{ai_dynamo.name} requires AISimulate for a base installation"
+        )
+    environment["extra"] = "aisimulate"
+    if not aisimulate_requirement.marker.evaluate(environment):
+        raise AssertionError(
+            f"{ai_dynamo.name} does not require AISimulate through its aisimulate extra"
         )
 
     for wheel in (ai_dynamo, runtime):
@@ -384,6 +419,12 @@ from dynamo._core import __version__
 assert runtime
 assert __version__[0].isdigit()
 assert metadata.version("ai-dynamo") == metadata.version("ai-dynamo-runtime")
+try:
+    metadata.version("aisimulate")
+except metadata.PackageNotFoundError:
+    pass
+else:
+    raise AssertionError("base ai-dynamo installation unexpectedly includes AISimulate")
 """
     run([str(venv_python), "-c", code])
 
@@ -465,18 +506,18 @@ def install_core(wheelhouse: Path, python_spec: str) -> None:
         shutil.rmtree(venv_python.parent.parent, ignore_errors=True)
 
 
-def install_mocker_support(wheelhouse: Path, python_spec: str) -> None:
+def install_aisimulate_extra(wheelhouse: Path, python_spec: str) -> None:
     ai_dynamo = require_one_wheel(wheelhouse, "ai-dynamo")
     runtime = require_one_wheel(wheelhouse, "ai-dynamo-runtime")
 
     venv_python = create_venv(python_spec)
     try:
-        # AISimulate is a direct ai-dynamo dependency on supported Python versions
-        # and provides the canonical estimator used by Mocker.
+        # AISimulate provides the canonical estimator used by Mocker and is installed
+        # only when its ai-dynamo extra is selected.
         pip_install(
             venv_python,
             wheelhouse,
-            [str(runtime), str(ai_dynamo)],
+            [str(runtime), f"{ai_dynamo}[aisimulate]"],
         )
         pip_check(venv_python)
         assert_dynamo_local_install(venv_python, wheelhouse, ai_dynamo, runtime)

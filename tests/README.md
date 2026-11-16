@@ -107,10 +107,15 @@ Prefer API responses, structured response fields, metrics, or direct test helper
 ### AISimulate dependency regression coverage
 
 - `tests/dependencies/test_aisimulate_consistency.py` checks exact, matching
-  AISimulate pins in Python manifests, container requirements, and Cargo files.
-  Missing declarations and unbounded requirements fail these checks. Current
-  containers stage AISimulate through `requirements.aisimulate.txt`; the former
-  AIC cap in the `mocker` extra and planner requirements is obsolete.
+  AISimulate pins in the `ai-dynamo[aisimulate]` extra, Python manifests,
+  container requirements, and Cargo files. It also checks that the base
+  `ai-dynamo` install omits AISimulate. Missing declarations and unbounded
+  requirements fail these checks. Current containers stage AISimulate through
+  `requirements.aisimulate.txt`; the former AIC cap in the `mocker` extra and
+  planner requirements is obsolete.
+- `tests/wheels/test_dynamo_wheel_smoke.py` checks the built wheel metadata and
+  clean-room installs: the base wheel omits AISimulate, while
+  `ai-dynamo[aisimulate]` installs the canonical estimator.
 - `components/src/dynamo/profiler/tests/unit/test_replay_bench_imports.py` executes
   the replay benchmark module with AISimulate imports blocked. It checks that
   importing the module succeeds and that an AIC comparison requires AISimulate
